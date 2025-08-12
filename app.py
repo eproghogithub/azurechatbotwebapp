@@ -4,6 +4,7 @@
 # Local run: python app.py  → test with Bot Framework Emulator at http://localhost:3978/api/messages
 
 from aiohttp import web
+from pathlib import Path
 import os, sys, time, json, logging
 from botbuilder.core import ActivityHandler, TurnContext, BotFrameworkAdapter, BotFrameworkAdapterSettings
 from botbuilder.schema import Activity
@@ -23,95 +24,169 @@ QNA_CONF_THRESHOLD      = 0.50
 
 PORT = 8000  # App Service will override this with its own PORT; locally 3978 is standard
 # ============================================================================
-# ---------- Logging setup ----------
-LOG_LEVEL = "DEBUG"  # change to "DEBUG" for deeper traces
+# ---------- traffic.log in current directory ----------
+BASE_DIR = Path(__file__).resolve().parent
+TRAFFIC_LOG = BASE_DIR / "traffic.log"
+
+def _init_traffic_log():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(TRAFFIC_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "startup",
+            "base_dir": str(BASE_DIR),
+            "log_path": str(TRAFFIC_LOG)
+        }, ensure_ascii=False) + "\n")
+    print(f"[traffic-log] Using {TRAFFIC_LOG}", file=sys.stdout)
+
+_init_traffic_log()
+
+def write_traffic(record: dict):
+    with open(TRAFFIC_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+# ---------- console logging (optional) ----------
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    level=logging.INFO,
     stream=sys.stdout,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     force=True,
 )
 log = logging.getLogger("bot")
-# Optional: turn up/down Azure SDK logs
-logging.getLogger("azure").setLevel(logging.WARNING)   # set to INFO/DEBUG if needed
-logging.getLogger("aiohttp.access").setLevel(logging.INFO)
 
-def _mask(s: str, show=4):
-    if not s: return ""
-    return s[:show] + "…" if len(s) > show else s
-
-log.info(
-    "Startup config | endpoint=%s project=%s deployment=%s threshold=%.2f appId=%s",
-    AZURE_LANGUAGE_ENDPOINT, AZURE_QNA_PROJECT, AZURE_QNA_DEPLOYMENT, QNA_CONF_THRESHOLD, _mask(APP_ID)
-)
-
-# ---------- AIOHTTP middleware: log every HTTP request ----------
+# ---------- HTTP traffic logger middleware ----------
 @web.middleware
-async def request_logger(request, handler):
+async def traffic_http_logger(request, handler):
     t0 = time.time()
+    req_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() in ("content-type", "user-agent", "authorization")}
+    if "authorization" in req_headers:
+        req_headers["authorization"] = "<masked>"
+
+    raw_body = None
+    if request.can_read_body:
+        try:
+            raw_body = await request.text()
+        except Exception:
+            raw_body = None
+
     try:
         response = await handler(request)
-        dt = (time.time() - t0) * 1000
-        log.info("HTTP %s %s -> %s (%.1f ms)", request.method, request.path_qs, response.status, dt)
+        elapsed = int((time.time() - t0) * 1000)
+        # note: for non-JSON responses, response.text may be None in aiohttp
+        resp_text = getattr(response, "text", None)
+        if callable(resp_text):
+            resp_text = None
+        write_traffic({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "http_traffic",
+            "http": {
+                "remote": request.remote,
+                "method": request.method,
+                "path": request.path,
+                "query": request.query_string,
+                "headers": req_headers,
+                "body_preview": (raw_body[:2000] if raw_body else None),
+                "status": response.status,
+                "resp_content_type": getattr(response, "content_type", None),
+                "resp_length": getattr(response, "content_length", None),
+                "resp_text_preview": (resp_text[:1000] if isinstance(resp_text, str) else None),
+                "elapsed_ms": elapsed
+            }
+        })
         return response
-    except Exception:
-        dt = (time.time() - t0) * 1000
-        log.exception("HTTP %s %s FAILED (%.1f ms)", request.method, request.path_qs, dt)
+    except Exception as e:
+        elapsed = int((time.time() - t0) * 1000)
+        write_traffic({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "http_traffic_error",
+            "http": {
+                "remote": request.remote,
+                "method": request.method,
+                "path": request.path,
+                "query": request.query_string,
+                "headers": req_headers,
+                "body_preview": (raw_body[:2000] if raw_body else None),
+                "status": 500,
+                "elapsed_ms": elapsed
+            },
+            "error": f"{type(e).__name__}: {e}"
+        })
         raise
 
-# ---------- QnA client ----------
+# ---------- Azure QnA client ----------
 qa_client = QuestionAnsweringClient(
     AZURE_LANGUAGE_ENDPOINT,
     AzureKeyCredential(AZURE_LANGUAGE_KEY)
 )
 
-# ---------- Bot ----------
+# ---------- Bot logic ----------
 class QnABot(ActivityHandler):
     async def on_message_activity(self, turn_context: TurnContext):
-        text = (turn_context.activity.text or "").strip()
-        chan = getattr(turn_context.activity, "channel_id", "unknown")
-        conv = getattr(turn_context.activity, "conversation", None)
-        conv_id = getattr(conv, "id", None) if conv else None
+        act = turn_context.activity
+        user_text = (act.text or "").strip()
 
-        log.info("Activity: channel=%s convId=%s text=%r", chan, conv_id, text)
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "turn",
+            "request": {
+                "text": user_text,
+                "channelId": getattr(act, "channel_id", None),
+                "conversationId": getattr(getattr(act, "conversation", None), "id", None),
+            },
+            "qna": None,
+            "response": None,
+        }
 
-        if not text:
-            await turn_context.send_activity("Say something and I’ll try to help!")
+        if not user_text:
+            reply = "Say something and I’ll try to help!"
+            record["response"] = {"text": reply, "fallback": True}
+            write_traffic(record)
+            await turn_context.send_activity(reply)
             return
 
         try:
             t0 = time.time()
             resp = qa_client.get_answers(
-                question=text,
+                question=user_text,
                 project_name=AZURE_QNA_PROJECT,
                 deployment_name=AZURE_QNA_DEPLOYMENT
             )
-            dt = (time.time() - t0) * 1000
-            n = len(resp.answers or [])
-            log.info("QnA returned %d answer(s) in %.1f ms", n, dt)
+            ms = int((time.time() - t0) * 1000)
 
-            if not resp.answers:
-                log.info("QnA: no answers → using fallback")
-                await turn_context.send_activity("Sorry, I don’t know the answer.")
+            answers = resp.answers or []
+            best = answers[0] if answers else None
+            conf = float(getattr(best, "confidence", 0.0) or 0.0) if best else 0.0
+            ans  = (best.answer or "").replace("\n", " ").strip() if best else ""
+            src  = getattr(best, "source", None) if best else None
+
+            record["qna"] = {
+                "count": len(answers),
+                "elapsed_ms": ms,
+                "best_confidence": conf,
+                "best_source": src,
+                "best_preview": ans[:200]
+            }
+
+            if not best or conf < QNA_CONF_THRESHOLD:
+                reply = "Sorry, I don’t know the answer."
+                record["response"] = {"text": reply, "fallback": True}
+                write_traffic(record)
+                await turn_context.send_activity(reply)
                 return
 
-            best = resp.answers[0]
-            ans_txt = (best.answer or "").replace("\n", " ").strip()
-            conf = float(best.confidence or 0.0)
-            src = getattr(best, "source", None)
+            reply = ans
+            record["response"] = {"text": reply, "fallback": False, "confidence": conf, "source": src}
+            write_traffic(record)
+            await turn_context.send_activity(reply)
 
-            log.info("QnA BEST | conf=%.2f source=%s answer=%r", conf, src, ans_txt[:200])
-
-            if conf < QNA_CONF_THRESHOLD:
-                log.info("QnA: confidence %.2f < %.2f → fallback", conf, QNA_CONF_THRESHOLD)
-                await turn_context.send_activity("Sorry, I don’t know the answer.")
-                return
-
-            await turn_context.send_activity(ans_txt)
-
-        except Exception:
-            log.exception("QnA call failed")
-            await turn_context.send_activity("Sorry, something went wrong.")
+        except Exception as e:
+            reply = "Sorry, something went wrong."
+            record["error"] = f"{type(e).__name__}: {e}"
+            record["response"] = {"text": reply, "fallback": True}
+            write_traffic(record)
+            logging.exception("QnA call failed")
+            await turn_context.send_activity(reply)
 
 # ---------- Adapter & routes ----------
 adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PW))
@@ -119,38 +194,39 @@ bot = QnABot()
 
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in (req.headers.get("Content-Type") or ""):
-        log.warning("Bad Content-Type: %s", req.headers.get("Content-Type"))
+        # logged by middleware too; add a small line here
+        write_traffic({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "bad_content_type",
+            "path": "/api/messages",
+            "content_type": req.headers.get("Content-Type")
+        })
         return web.Response(status=415, text="Content-Type must be application/json")
 
     body = await req.json()
-    # log incoming activity summary (truncate safely)
-    try:
-        snippet = json.dumps(
-            {k: body.get(k) for k in ("type", "text", "channelId", "deliveryMode")},
-            ensure_ascii=False
-        )
-        log.info("Incoming activity: %s", snippet)
-    except Exception:
-        log.debug("Raw activity: %s", body)
-
     activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    try:
-        await adapter.process_activity(activity, auth_header, bot.on_turn)
-        # If client used deliveryMode=expectReplies, SDK returns activities inline
-        return web.Response(status=201, text="OK")
-    except Exception:
-        log.exception("process_activity failed")
-        return web.Response(status=500, text="process_activity failed")
+    await adapter.process_activity(activity, auth_header, bot.on_turn)
+
+    resp = web.Response(status=201, text="OK")
+    # explicit route-level response log (middleware also logs)
+    write_traffic({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "route_response",
+        "path": "/api/messages",
+        "status": resp.status,
+        "text": resp.text
+    })
+    return resp
 
 def create_app():
-    app = web.Application(middlewares=[request_logger])
+    app = web.Application(middlewares=[traffic_http_logger])
     app.router.add_post("/api/messages", messages)
     app.router.add_get("/", lambda req: web.Response(text="Bot is running."))  # health
     return app
 
 if __name__ == "__main__":
-    PORT = int(os.getenv("PORT", "8000"))  # 8000 locally; Azure injects PORT value
-    log.info("Listening on 0.0.0.0:%s", PORT)
+    PORT = int(os.getenv("PORT", "8000"))  # 8000 locally; Azure provides PORT
+    print(f"Listening on 0.0.0.0:{PORT}  (traffic log: {TRAFFIC_LOG})")
     web.run_app(create_app(), host="0.0.0.0", port=PORT)
