@@ -189,7 +189,10 @@ class QnABot(ActivityHandler):
             await turn_context.send_activity(reply)
 
 # ---------- Adapter & routes ----------
-adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PW))
+from botbuilder.core import BotFrameworkAdapterSettings
+settings = BotFrameworkAdapterSettings(APP_ID, APP_PW)
+settings.oauth_scope = "https://api.botframework.com/.default"  # explicit
+adapter = BotFrameworkAdapter(settings)
 bot = QnABot()
 
 async def messages(req: web.Request) -> web.Response:
