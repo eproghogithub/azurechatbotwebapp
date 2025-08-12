@@ -45,7 +45,7 @@ def write_traffic(record: dict):
     with open(TRAFFIC_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-# ---------- console logging (optional) ----------
+# ---------- console logging ----------
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stdout,
@@ -53,6 +53,17 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger("bot")
+
+# Optional: show connector auth details if needed
+# logging.getLogger("botframework.connector.auth").setLevel(logging.DEBUG)
+
+# ---------- Startup audit (prove which values are used) ----------
+def _mask(s, n=6): return s[:n]+"…" if s else "<empty>"
+print(
+    "[startup] file=%s  appId=%s  secret_len=%s  qna=%s/%s  endpoint=%s" %
+    (__file__, _mask(APP_ID), len(APP_PW or ""), AZURE_QNA_PROJECT, AZURE_QNA_DEPLOYMENT, AZURE_LANGUAGE_ENDPOINT),
+    flush=True
+)
 
 # ---------- HTTP traffic logger middleware ----------
 @web.middleware
@@ -73,9 +84,8 @@ async def traffic_http_logger(request, handler):
     try:
         response = await handler(request)
         elapsed = int((time.time() - t0) * 1000)
-        # note: for non-JSON responses, response.text may be None in aiohttp
         resp_text = getattr(response, "text", None)
-        if callable(resp_text):
+        if callable(resp_text):  # aiohttp may expose as callable in some versions
             resp_text = None
         write_traffic({
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -107,7 +117,7 @@ async def traffic_http_logger(request, handler):
                 "query": request.query_string,
                 "headers": req_headers,
                 "body_preview": (raw_body[:2000] if raw_body else None),
-                "status": 200,
+                "status": 500,
                 "elapsed_ms": elapsed
             },
             "error": f"{type(e).__name__}: {e}"
@@ -185,19 +195,19 @@ class QnABot(ActivityHandler):
             record["error"] = f"{type(e).__name__}: {e}"
             record["response"] = {"text": reply, "fallback": True}
             write_traffic(record)
-            logging.exception("QnA call failed")
+            log.exception("QnA call failed")
             await turn_context.send_activity(reply)
 
 # ---------- Adapter & routes ----------
-from botbuilder.core import BotFrameworkAdapterSettings
+# Explicit OAuth scope so it matches your successful token test
 settings = BotFrameworkAdapterSettings(APP_ID, APP_PW)
-settings.oauth_scope = "https://api.botframework.com/.default"  # explicit
+settings.oauth_scope = "https://api.botframework.com/.default"
 adapter = BotFrameworkAdapter(settings)
+
 bot = QnABot()
 
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in (req.headers.get("Content-Type") or ""):
-        # logged by middleware too; add a small line here
         write_traffic({
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event": "bad_content_type",
@@ -213,7 +223,6 @@ async def messages(req: web.Request) -> web.Response:
     await adapter.process_activity(activity, auth_header, bot.on_turn)
 
     resp = web.Response(status=201, text="OK")
-    # explicit route-level response log (middleware also logs)
     write_traffic({
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "event": "route_response",
@@ -230,6 +239,6 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    PORT = int(os.getenv("PORT", "8000"))  # 8000 locally; Azure provides PORT
+    PORT = int(os.getenv("PORT", "8000"))  # Azure sets PORT; 8000 for local
     print(f"Listening on 0.0.0.0:{PORT}  (traffic log: {TRAFFIC_LOG})")
     web.run_app(create_app(), host="0.0.0.0", port=PORT)
