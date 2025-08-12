@@ -12,8 +12,8 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.language.questionanswering import QuestionAnsweringClient
 
 # ======== CONFIG: replace with your values (NO environment variables) ========
-APP_ID  = "5b071f37-6086-461a-a8b7-2a56daeeb32a"   # e.g., "00000000-0000-0000-0000-000000000000" (leave "" for local Emulator without auth)
-APP_PW  = "73a33cde-5f89-4b8f-a4c1-33231bc7a21f"   # client secret (leave "" for local Emulator without auth)
+APP_ID  = "60c9d0f0-bbb0-4194-9ed2-627e87016387"   # e.g., "00000000-0000-0000-0000-000000000000" (leave "" for local Emulator without auth)
+APP_PW  = "ddu8Q~A0b9iHsNU.HPyAtqyRkLUIKsKkk~mmubxD"   # client secret (leave "" for local Emulator without auth)
 
 AZURE_LANGUAGE_ENDPOINT = "https://prosenjitnlp1.cognitiveservices.azure.com".rstrip("/")
 AZURE_LANGUAGE_KEY      = "E8JBjaa05yTzIW2XmkfaFmNF92J7Aw7YZlyD1ISLvy6YLeLgsau7JQQJ99BHACYeBjFXJ3w3AAAaACOGpEXu"
