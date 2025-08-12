@@ -107,7 +107,7 @@ async def traffic_http_logger(request, handler):
                 "query": request.query_string,
                 "headers": req_headers,
                 "body_preview": (raw_body[:2000] if raw_body else None),
-                "status": 500,
+                "status": 200,
                 "elapsed_ms": elapsed
             },
             "error": f"{type(e).__name__}: {e}"
